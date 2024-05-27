@@ -1,0 +1,860 @@
+<!-- livebook:{"app_settings":{"output_type":"rich","show_source":true,"slug":"cinex"}} -->
+
+# EFMPEG
+
+```elixir
+Mix.install(
+  [
+    {:kino, "~> 0.12.3"},
+    {:instructor, "~> 0.0.5"},
+    {:erlexec, "~> 2.0"},
+    {:exterval, "~> 0.2.0"}
+  ],
+  config: [
+    instructor: [
+      adapter: Instructor.Adapters.OpenAI,
+      openai: [api_key: System.fetch_env!("LB_OPENAI_TOKEN")]
+    ]
+  ]
+)
+```
+
+## Setup State Management
+
+```elixir
+defmodule Upload do
+  defstruct [:filename, :path]
+
+  @video_types [:mp4, :ogg, :avi, :wmv, :mov]
+  @audio_types [:wav, :mp3, :mpeg]
+  @image_types [:jpeg, :jpg, :png, :gif, :svg, :pixel]
+
+  defguard is_audio(ext) when ext in @audio_types
+  defguard is_video(ext) when ext in @video_types
+  defguard is_image(ext) when ext in @image_types
+  defguard is_valid_upload(ext) when is_audio(ext) or is_video(ext) or is_image(ext)
+
+  def accepted_types, do: @audio_types ++ @video_types ++ @image_types
+
+  defp to_existing_atom(str) do
+    try do
+      {:ok, String.to_existing_atom(str)}
+    rescue
+      _ in ArgumentError ->
+        {:error, "#{inspect(str)} is not an existing atom"}
+
+      _e ->
+        {:error, "Unknown Error ocurred in `String.to_existing_atom/1`"}
+    end
+  end
+
+  def ext_type(filename) do
+    with <<"."::utf8, rest::binary>> <- Path.extname(filename),
+         {:ok, ext} <- to_existing_atom(rest) do
+      ext
+    end
+  end
+
+  def to_kino(upload = %__MODULE__{path: path}) do
+    content = File.read!(upload.path)
+
+    case ext_type(path) do
+      ext when is_audio(ext) ->
+        Kino.Audio.new(content, ext)
+
+      ext when is_video(ext) ->
+        Kino.Video.new(content, ext)
+
+      ext when is_image(ext) ->
+        Kino.Image.new(content, ext)
+    end
+  end
+
+  def new(filename, path) do
+    %__MODULE__{filename: filename, path: path}
+  end
+
+  def generate_temp_filename(extension \\ "mp4") do
+    random_string = :crypto.strong_rand_bytes(8) |> Base.encode16()
+    temp_dir = System.tmp_dir!()
+    Path.join(temp_dir, "temp_#{random_string}.#{extension}")
+  end
+end
+
+defmodule FormState do
+  use Agent
+
+  def start_link(_init) do
+    Agent.start_link(fn -> %{prompt: "", retries: 2, debug: false, explain_outputs: true} end,
+      name: __MODULE__
+    )
+  end
+
+  def update(key, value) do
+    Agent.update(__MODULE__, fn state -> Map.put(state, key, value) end)
+  end
+
+  def get(key) do
+    Agent.get(__MODULE__, fn state -> Map.get(state, key) end)
+  end
+end
+
+defmodule EditHistory do
+  use Agent
+
+  def start_link(_init) do
+    Agent.start_link(fn -> :queue.new() end, name: __MODULE__)
+  end
+
+  def push(%Upload{} = upload, prompt \\ nil) do
+    Agent.update(__MODULE__, fn history ->
+      :queue.snoc(history, {upload, prompt})
+    end)
+  end
+
+  def undo_edit do
+    Agent.get_and_update(__MODULE__, fn history ->
+      popped = :queue.liat(history)
+      {:queue.last(popped), popped}
+    end)
+  end
+
+  def current do
+    Agent.get(__MODULE__, fn history ->
+      :queue.last(history)
+    end)
+  end
+
+  def original do
+    Agent.get(__MODULE__, fn history ->
+      :queue.head(history)
+    end)
+  end
+
+  def previous_edit do
+    Agent.get(__MODULE__, fn history ->
+      popped = :queue.liat(history)
+
+      unless :queue.is_empty(popped) do
+        :queue.last(popped)
+      else
+        nil
+      end
+    end)
+  end
+
+  def reset do
+    Agent.get_and_update(__MODULE__, fn history ->
+      original = :queue.head(history)
+      {original, :queue.from_list([original])}
+    end)
+  end
+end
+```
+
+```elixir
+Enum.each([EditHistory, FormState], &Kino.start_child!/1)
+```
+
+## Setup Boilerplate
+
+```elixir
+defmodule Boilerplate do
+  def placeholder,
+    do: """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Video Preview Placeholder with Spinner</title>
+        <style>
+            .video-preview-placeholder {
+                width: 100%;
+                max-width: 640px;
+                height: 0;
+                padding-bottom: 56.25%; /* 16:9 aspect ratio */
+                border: 2px dashed #ccc;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background-color: #f9f9f9;
+                color: #666;
+                font-size: 20px;
+                text-align: center;
+                position: relative;
+                box-sizing: border-box;
+                margin: auto;
+            }
+            .spinner-container {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+            }
+            .spinner {
+                border: 4px solid #f3f3f3;
+                border-top: 4px solid #3498db;
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                animation: spin 2s linear infinite;
+                margin-bottom: 10px;
+            }
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+            .message {
+                font-size: 16px;
+                color: #666;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="video-preview-placeholder">
+            <div class="spinner-container">
+                <%= if show_spinner do %>
+                    <div class="spinner"></div>
+                <% end %>
+                <div class="message"><%= message %></div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+  def log_template,
+    do: """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Log Level Message Box</title>
+        <style>
+            .message-box {
+                width: 100%;
+                border: 2px solid;
+                padding: 20px;
+                box-sizing: border-box;
+                margin: 20px 0;
+                border-radius: 5px;
+                font-size: 18px;
+                text-align: left;
+            }
+            .message-box.error {
+                border-color: #f44336;
+                background-color: #fdecea;
+                color: #f44336;
+            }
+            .message-box.success {
+                border-color: #4caf50;
+                background-color: #e8f5e9;
+                color: #4caf50;
+            }
+            .message-box.info {
+                border-color: #2196f3;
+                background-color: #e3f2fd;
+                color: #2196f3;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="message-box <%= level %>">
+            <%= message %>
+        </div>
+    </body>
+    </html>
+    """
+
+  def stdout_template,
+    do: """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><%= device %></title>
+    <style>
+    body {
+        background-color: #1e1e1e;
+        color: #c5c8c6;
+        font-family: "Courier New", Courier, monospace;
+        margin: 0;
+        padding: 20px 20px 20px 5px;
+    }
+    .container {
+        border: 1px solid #444;
+        border-radius: 5px;
+        overflow: hidden;
+    }
+    .header {
+        background-color: #444;
+        color: #c5c8c6;
+        padding: 10px;
+        font-weight: bold;
+        text-transform: uppercase;
+    }
+    .output {
+        background-color: #1d1f21;
+        border-left: 4px solid <%= border_color %>;
+        padding: 12px 12px 12px 5px;
+        font-size: 16px;
+        color: #c5c8c6;
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+    </style>
+    </head>
+    <body>
+    <div class="container">
+    <div class="header">
+        <%= device %>
+    </div>
+    <div class="output">
+        <%= output %>
+    </div>
+    </div>
+    </body>
+    </html>
+    """
+
+  def make_stdout(output, device, border_color \\ "gray") do
+    Kino.HTML.new(EEx.eval_string(stdout_template(), binding()))
+  end
+
+  def make_log(message, level) do
+    Kino.HTML.new(EEx.eval_string(log_template(), binding()))
+  end
+end
+```
+
+## Setup Widgets
+
+```elixir
+original = Kino.Frame.new()
+prompt = Kino.Input.textarea("Prompt")
+upload = Kino.Input.file("Upload", accept: Upload.accepted_types())
+errors = Kino.Frame.new(placeholder: false)
+submit_button = Kino.Control.button("Run!")
+submit_frame = Kino.Frame.new(placeholder: false)
+undo_frame = Kino.Frame.new(placeholder: false)
+reset_frame = Kino.Frame.new(placeholder: false)
+undo_button = Kino.Control.button("Undo")
+reset_button = Kino.Control.button("Reset")
+stdout = Kino.Frame.new(placeholder: false)
+logs = Kino.Frame.new(placeholder: false)
+debug_checkbox = Kino.Input.checkbox("Verbose Mode")
+debug_frame = Kino.Frame.new(placeholder: false)
+explain_checkbox = Kino.Input.checkbox("Explain Outputs", default: true)
+explain_frame = Kino.Frame.new(placeholder: false)
+retries = Kino.Input.number("# Retries", default: 2)
+
+Kino.Frame.render(
+  original,
+  Kino.HTML.new(
+    EEx.eval_string(Boilerplate.placeholder(),
+      message: "Upload Media to Get Started",
+      show_spinner: false
+    )
+  )
+)
+
+inputs = Kino.Layout.grid([prompt, retries], columns: 2, gap: 10)
+
+buttons =
+  Kino.Layout.grid([submit_frame, undo_frame, reset_frame, explain_frame, debug_frame],
+    columns: 7,
+    gap: 1
+  )
+
+Kino.Layout.grid([original, inputs, upload, buttons, stdout, logs])
+```
+
+## FFMPEG Instructions
+
+```elixir
+defmodule Alfred do
+  use Ecto.Schema
+  use Instructor.Validator
+  import Ecto.Changeset
+  import Exterval
+  @confidence_interval ~i<[0,10]//0.5>
+
+  @system_prompt """
+  You are the companion Agent to another Agent whose job is to product execve-styled arguments
+  for programs given a specific prompt. Your job is to interpret and explain the output
+  of the command after it has been run. You will be given the prompt / task that originally
+  generated the command, then you will be given the command that was run, along with the
+  output that was generated. You do not need to re-explain what the task was or regurgitate
+  what the command was. You only need to explain what the output means within the context
+  of the task. If the task / prompt was a question, you should determine whether the provided
+  output directly answers the question and if it does not you should answer it based on the
+  output. If the output is not relevant to the prompt this should also be noted.
+
+
+  You will also provide a confidence score about how confident you are about the above explanation.
+  The confidence score is separate from the explanation.
+  """
+
+  @primary_key false
+  @doc """
+  ## Field Descriptions:
+  - explanation: Explanation of the output given the context of the task and command that was run
+  - confidence: Rating from 0 to 10 in increments of 0.5 of how confident you are in your answer,
+    with higher scores being more confident.
+  """
+  embedded_schema do
+    field(:explanation, :string)
+    field(:confidence, :float)
+  end
+
+  @impl true
+  def validate_changeset(changeset) do
+    changeset
+    |> validate_inclusion(:confidence, @confidence_interval)
+  end
+
+  def execute(prompt, command, retries, outputs \\ [stdout: nil, stderr: nil]) do
+    Instructor.chat_completion(
+      model: "gpt-4o",
+      response_model: __MODULE__,
+      max_retries: retries,
+      messages:
+        [
+          %{
+            role: "system",
+            content: @system_prompt
+          },
+          %{
+            role: "user",
+            content: """
+            Here's the prompt that generated the command: #{inspect(prompt)}
+            """
+          },
+          %{
+            role: "user",
+            content: """
+            Here's command: #{inspect(command)}
+            """
+          },
+          Keyword.get(outputs, :stdout) &&
+            %{
+              role: "user",
+              content: """
+              stdout: #{inspect(Keyword.fetch!(outputs, :stdout))}
+              """
+            },
+          Keyword.get(outputs, :stderr) &&
+            %{
+              role: "user",
+              content: """
+              stderr: #{inspect(Keyword.fetch!(outputs, :stderr))}
+              """
+            }
+        ]
+        |> Enum.filter(& &1)
+    )
+  end
+end
+```
+
+```elixir
+defmodule AutoFfmpeg do
+  use Ecto.Schema
+  use Instructor.Validator
+
+  @system_prompt """
+  You are a multimedia editor and your job is to receive tasks for multimedia editing and use
+  the programs available to you (and only those) to complete the tasks. You will return arguments
+  to be passed to the program assuming that the input file(s) has already been passed. You do not need to
+  call the binary itself, you are only in charge of generating all subsequent
+  arugments after inputs have been passed. Assume the output file path will be appended
+  after the arguments you provide.
+
+  You have access to the following programs: ffmpeg and ffprobe
+
+  So assume the command already is composed of something like
+  `ffmpeg -i input_file_path [..., args, ...] output_file_path` and you then pass arugments
+  to complete the given task. You will also be provided the input file for context, but you
+  should not include inputs in your arguments. Use the given file extension to determine how
+  to form your arugments. You will also provide the output file
+  extension / file type, since depending on the task it could differ from the input type. If the
+  given task does not result in an operation that writes to a file, (eg. asking for timestamps
+  where it is silent would result in writing to stdout), the extension would be `null`.
+
+  If the command is such that it will output to stdout, you should output as JSON when
+  possible.
+  """
+
+  @doc """
+  ## Field Descriptions:
+  - program: the executable program to call
+  - arguments: execve-formatted arguments for the  command
+  - output_ext: The extension (filetype) of the outputted file
+  """
+  @primary_key false
+  embedded_schema do
+    field(:program, Ecto.Enum, values: [:ffmpeg, :ffprobe])
+    field(:arguments, {:array, :string})
+
+    field(:output_ext, Ecto.Enum,
+      values: [
+        :mp4,
+        :ogg,
+        :avi,
+        :wmv,
+        :mov,
+        :wav,
+        :mp3,
+        :mpeg,
+        :jpeg,
+        :jpg,
+        :png,
+        :gif,
+        :svg,
+        :pixel,
+        :null
+      ]
+    )
+
+    field(:output_path, :string, virtual: true)
+  end
+
+  @impl true
+  def validate_changeset(
+        changeset,
+        %{
+          upload_path: upload_path,
+          debug: debug,
+          debug_frame: debug_frame,
+          output_frame: output_frame,
+          prompt: prompt,
+          explain: explain,
+          retries: retries
+        }
+      ) do
+    program = Ecto.Changeset.get_field(changeset, :program)
+    program_args = Ecto.Changeset.get_field(changeset, :arguments)
+    input_args = ["-i", upload_path]
+    output_ext = Ecto.Changeset.get_field(changeset, :output_ext)
+
+    output_args =
+      cond do
+        program == :ffprobe ->
+          []
+
+        output_ext == :null ->
+          ["-f", "null", "-"]
+
+        true ->
+          [Upload.generate_temp_filename(Atom.to_string(output_ext))]
+      end
+
+    command =
+      Enum.join([Atom.to_string(program) | input_args ++ program_args ++ output_args], " ")
+
+    if debug do
+      message = """
+      <strong>Prompt:</strong> <em>#{prompt}</em><br><br>
+      <strong>Command:</strong> <code>#{command}</code>
+      """
+
+      Kino.Frame.append(
+        debug_frame,
+        Boilerplate.make_log(
+          message,
+          :info
+        )
+      )
+    end
+
+    case :exec.run(command, [
+           :sync,
+           :stdout,
+           :stderr
+         ]) do
+      {:ok, result} when is_list(result) ->
+        outputs =
+          [:stdout, :stderr]
+          |> Enum.map(fn device ->
+            if Keyword.has_key?(result, device) do
+              output = Enum.join(Keyword.fetch!(result, device), "")
+              Kino.Frame.append(output_frame, Boilerplate.make_stdout(output, device))
+              {device, output}
+            else
+              {device, nil}
+            end
+          end)
+
+        if explain do
+          case Alfred.execute(prompt, command, retries, outputs) do
+            {:ok, %Alfred{explanation: explanation, confidence: confidence}} ->
+              Kino.Frame.append(
+                output_frame,
+                Boilerplate.make_stdout(
+                  "<strong>Explanation:</strong> #{explanation}\n\n<strong>Confidence:</strong> #{confidence}",
+                  :alfred,
+                  "green"
+                )
+              )
+
+            {:error,
+             %Ecto.Changeset{
+               errors: [
+                 explanation: {error, _extras}
+               ],
+               valid?: false
+             }} ->
+              Kino.Frame.append(
+                debug_frame,
+                Boilerplate.make_log("Trouble providing explanation: #{inspect(error)}", :error)
+              )
+          end
+        end
+
+        if program == :ffmpeg && output_ext != :null do
+          [output_path] = output_args
+          Ecto.Changeset.put_change(changeset, :output_path, output_path)
+        else
+          changeset
+        end
+
+      {:error, result} when is_list(result) ->
+        debug &&
+          Kino.Frame.append(
+            debug_frame,
+            Boilerplate.make_log("Something Went Wrong! Retrying...", :error)
+          )
+
+        error =
+          cond do
+            Keyword.has_key?(result, :stderr) ->
+              Keyword.fetch!(result, :stderr) |> Enum.join("")
+
+            Keyword.has_key?(result, :stdout) ->
+              Keyword.fetch!(result, :stdout) |> Enum.join("")
+
+            Keyword.has_key?(result, :exit_signal) ->
+              "Error resulted in exit code #{Keyword.fetch!(result, :exit_signal)}"
+
+            true ->
+              "Unexpected error occurred!"
+          end
+
+        Ecto.Changeset.add_error(
+          changeset,
+          :arguments,
+          error,
+          status: Keyword.get(result, :exit_status)
+        )
+    end
+  end
+
+  def execute(prompt, %{upload_path: upload_path} = context, retries) do
+    Instructor.chat_completion(
+      model: "gpt-4o",
+      validation_context: Map.put(context, :prompt, prompt) |> Map.put(:retries, retries),
+      response_model: __MODULE__,
+      max_retries: retries,
+      messages: [
+        %{
+          role: "system",
+          content: @system_prompt
+        },
+        %{
+          role: "user",
+          content: """
+          Here's the editing task: #{inspect(prompt)}
+          """
+        },
+        %{
+          role: "user",
+          content: """
+          Here's input file type: #{inspect(Upload.ext_type(upload_path))}
+          """
+        }
+      ]
+    )
+  end
+end
+```
+
+## Listeners
+
+```elixir
+import Upload
+
+[
+  upload: upload,
+  submit: submit_button,
+  reset: reset_button,
+  undo: undo_button,
+  prompt: prompt,
+  debug: debug_checkbox,
+  retries: retries,
+  explain: explain_checkbox
+]
+|> Kino.Control.tagged_stream()
+|> Kino.listen(fn
+  {:explain, %{type: :change, value: value}} ->
+    FormState.update(:explain_outputs, value)
+
+  {:retries, %{type: :change, value: value}} ->
+    FormState.update(:retries, value)
+
+  {:debug, %{type: :change, value: value}} ->
+    FormState.update(:debug, value)
+
+  {:prompt, %{type: :change, value: prompt}} ->
+    FormState.update(:prompt, prompt)
+
+  {:upload,
+   %{
+     type: :change,
+     value: %{
+       file_ref: file_ref,
+       client_name: filename
+     }
+   }} ->
+    Kino.Frame.clear(logs)
+    Kino.Frame.clear(stdout)
+    ext_type = Upload.ext_type(filename)
+
+    unless is_valid_upload(ext_type) do
+      Kino.Frame.render(
+        logs,
+        Boilerplate.make_log(
+          "File must be of one of the following types: #{inspect(Upload.accepted_types())}",
+          :error
+        )
+      )
+    else
+      file_path =
+        file_ref
+        |> Kino.Input.file_path()
+
+      tmp_path = Upload.generate_temp_filename(ext_type)
+      _bytes_copied = File.copy!(file_path, tmp_path)
+      upload = Upload.new(filename, tmp_path)
+      Upload.to_kino(upload) |> then(&Kino.Frame.render(original, &1))
+      EditHistory.push(upload)
+      Kino.Frame.render(debug_frame, debug_checkbox)
+      Kino.Frame.render(explain_frame, explain_checkbox)
+      Kino.Frame.render(submit_frame, submit_button)
+      Kino.Frame.clear(undo_frame)
+      Kino.Frame.clear(reset_frame)
+    end
+
+  {:submit, %{type: :click}} ->
+    Kino.Frame.clear(logs)
+    Kino.Frame.clear(stdout)
+
+    prompt = FormState.get(:prompt) |> String.trim()
+
+    if prompt == "" do
+      Kino.Frame.append(logs, Boilerplate.make_log("Prompt cannot be empty!", :error))
+    else
+      Kino.Frame.render(
+        original,
+        Kino.HTML.new(
+          EEx.eval_string(Boilerplate.placeholder(), message: "Working...", show_spinner: true)
+        )
+      )
+
+      {%Upload{} =
+         current_upload, _old_prompt} = EditHistory.current()
+
+      case AutoFfmpeg.execute(
+             prompt,
+             %{
+               upload_path: current_upload.path,
+               debug: FormState.get(:debug),
+               debug_frame: logs,
+               output_frame: stdout,
+               explain: FormState.get(:explain_outputs)
+             },
+             FormState.get(:retries)
+           ) do
+        {:ok, %AutoFfmpeg{output_path: output_path}} ->
+          FormState.get(:debug) &&
+            Kino.Frame.append(logs, Boilerplate.make_log("Success!", :success))
+
+          unless is_nil(output_path) do
+            new_upload = Upload.new(current_upload.filename, output_path)
+            EditHistory.push(new_upload, prompt)
+            Upload.to_kino(new_upload) |> then(&Kino.Frame.render(original, &1))
+          else
+            Upload.to_kino(current_upload) |> then(&Kino.Frame.render(original, &1))
+          end
+
+          Kino.Frame.render(undo_frame, undo_button)
+          Kino.Frame.render(reset_frame, reset_button)
+
+        {:error,
+         %Ecto.Changeset{
+           changes: %{
+             arguments: _arguments,
+             output_ext: _output_ext
+           },
+           errors: [
+             arguments: {error, [status: _status]}
+           ],
+           valid?: false
+         }} ->
+          Upload.to_kino(current_upload) |> then(&Kino.Frame.render(original, &1))
+
+          Kino.Frame.append(logs, Boilerplate.make_log("Failed after 3 attempts!", :error))
+          Kino.Frame.append(logs, Boilerplate.make_log(error, :error))
+
+        {:error, <<"LLM Adapter Error: ", error::binary>>} ->
+          Upload.to_kino(current_upload) |> then(&Kino.Frame.render(original, &1))
+          {error, _binding} = error |> Code.eval_string()
+
+          Kino.Frame.append(
+            logs,
+            Boilerplate.make_log("Error! Reference the error below for details", :error)
+          )
+
+          Kino.Frame.append(logs, Kino.Tree.new(error))
+
+        {:error, <<"Invalid JSON returned from LLM: ", error::binary>>} ->
+          Upload.to_kino(current_upload) |> then(&Kino.Frame.render(original, &1))
+          Kino.Frame.append(logs, Boilerplate.make_log(error, :error))
+      end
+    end
+
+  {:reset, %{type: :click}} ->
+    {%Upload{} = original_upload, nil} = EditHistory.reset()
+    Upload.to_kino(original_upload) |> then(&Kino.Frame.render(original, &1))
+    Kino.Frame.clear(logs)
+    Kino.Frame.clear(stdout)
+    Kino.Frame.clear(reset_frame)
+    Kino.Frame.clear(undo_frame)
+
+  {:undo, %{type: :click}} ->
+    Kino.Frame.clear(logs)
+    Kino.Frame.clear(stdout)
+
+    case EditHistory.undo_edit() do
+      nil ->
+        Kino.Frame.append(logs, Kino.Text.new("Error! Cannot `Undo`. No previous edit."))
+
+      {%Upload{} = previous_upload, _previous_prompt} ->
+        Upload.to_kino(previous_upload) |> then(&Kino.Frame.render(original, &1))
+        Kino.Frame.clear(logs)
+
+        if EditHistory.previous_edit() == nil do
+          Kino.Frame.clear(reset_frame)
+          Kino.Frame.clear(undo_frame)
+        end
+    end
+end)
+```
+
+<!-- livebook:{"offset":24220,"stamp":{"token":"XCP.THHgnGco1EzFjFhoJZtF8mEa8HV0nuXUCN2ZUFNXaPWlld4m2PUJJkeBoMDI7c3Mt8dEnMLwhL7h9On6sk9_Jbz7IgADzFunzT2AGWCRRExXwhIdBlDi","version":2}} -->
