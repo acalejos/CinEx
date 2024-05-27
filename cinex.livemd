@@ -1,6 +1,6 @@
 <!-- livebook:{"app_settings":{"output_type":"rich","show_source":true,"slug":"cinex"}} -->
 
-# EFMPEG
+# CinEx
 
 ```elixir
 Mix.install(
