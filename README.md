@@ -6,6 +6,8 @@ The best way to use FFMPEG, conveniently in a single [Livebook](https://livebook
 
 [![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fraw.githubusercontent.com%2Facalejos%2FCinEx%2Fmain%2Fcinex.livemd)
 
+![demo.gif](demo.gif)
+
 ## Usage
 
 Simply install Livebook then you can click the **Run in Livebook** badge above to load the file.
