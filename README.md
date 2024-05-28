@@ -6,7 +6,7 @@ The best way to use FFMPEG, conveniently in a single [Livebook](https://livebook
 
 [![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fraw.githubusercontent.com%2Facalejos%2FCinEx%2Fmain%2Fcinex.livemd)
 
-![demo.gif](demo.gif)
+https://github.com/johnrees/CinEx/assets/601961/05c1ac25-bd5e-4653-ae36-5d7490ab0ef2
 
 ## Usage
 
