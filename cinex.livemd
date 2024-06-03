@@ -3,23 +3,16 @@
 # CinEx
 
 ```elixir
-Mix.install(
-  [
-    {:kino, "~> 0.12.3"},
-    {:instructor, "~> 0.0.5"},
-    {:erlexec, "~> 2.0"},
-    {:exterval, "~> 0.2.0"}
-  ],
-  config: [
-    instructor: [
-      adapter: Instructor.Adapters.OpenAI,
-      openai: [api_key: System.fetch_env!("LB_OPENAI_TOKEN")]
-    ]
-  ]
-)
+Mix.install([
+  {:kino, "~> 0.12.3"},
+  {:instructor, github: "acalejos/instructor_ex"},
+  {:erlexec, "~> 2.0"},
+  {:exterval, "~> 0.2.0"},
+  {:req, "~> 0.4.0"}
+])
 ```
 
-## Setup State Management
+## Upload Struct
 
 ```elixir
 defmodule Upload do
@@ -80,14 +73,123 @@ defmodule Upload do
     Path.join(temp_dir, "temp_#{random_string}.#{extension}")
   end
 end
+```
 
+## Setup State Management
+
+```elixir
+defmodule Models do
+  @oai_models Req.get!("https://api.openai.com/v1/models",
+                auth: {:bearer, System.fetch_env!("LB_OPENAI_TOKEN")}
+              )
+              |> Map.get(:body)
+              |> Map.get("data")
+              |> Enum.filter(fn entry -> Map.get(entry, "id") |> String.contains?("gpt") end)
+              |> Enum.sort_by(&Map.get(&1, "created"), :desc)
+              |> Enum.map(fn entry ->
+                model = Map.get(entry, "id")
+                {model, model}
+              end)
+
+  @ollama_models Req.get!("http://localhost:11434/api/tags")
+                 |> Map.get(:body)
+                 |> Map.get("models")
+                 |> Enum.sort_by(fn entry ->
+                   {:ok, datetime, _offset} =
+                     entry |> Map.get("modified_at") |> DateTime.from_iso8601()
+
+                   datetime
+                 end)
+                 |> Enum.map(fn entry ->
+                   name = Map.get(entry, "name")
+                   {name, name}
+                 end)
+  # There are many different ways to authenticate. This uses API Keys 
+  # See https://cloud.google.com/docs/authentication/api-keys
+  # We filter for only Gemini 1.5 models since those are the only to support JSON mode in the API
+  @gemini_models Req.get!("https://generativelanguage.googleapis.com/v1beta/models",
+                   headers: %{"x-goog-api-key" => System.fetch_env!("LB_GOOGLE_GEMINI_API_KEY")}
+                 )
+                 |> Map.get(:body)
+                 |> Map.get("models")
+                 |> Enum.filter(fn entry ->
+                   Map.get(entry, "name") |> String.contains?("gemini-1.5")
+                 end)
+                 |> Enum.map(fn entry ->
+                   {Map.get(entry, "name"), Map.get(entry, "displayName")}
+                 end)
+  def oai_models, do: @oai_models
+  def ollama_models, do: @ollama_models
+  def gemini_models, do: @gemini_models
+end
+```
+
+```elixir
 defmodule FormState do
   use Agent
 
+  @openai_config [
+    http_options: [receive_timeout: 10 * 60 * 1000],
+    api_key: System.fetch_env!("LB_OPENAI_TOKEN"),
+    api_url: "https://api.openai.com",
+    adapter: Instructor.Adapters.OpenAI
+  ]
+
+  @ollama_config [
+    http_options: [receive_timeout: 10 * 60 * 1000],
+    api_key: "ollama",
+    api_url: "http://localhost:11434",
+    adapter: Instructor.Adapters.OpenAI
+  ]
+
+  @gemini_config [
+    api_version: :v1beta,
+    api_url: "https://generativelanguage.googleapis.com/",
+    http_options: [receive_timeout: 60_000],
+    api_key: System.fetch_env!("LB_GOOGLE_GEMINI_API_KEY"),
+    adapter: Instructor.Adapters.Gemini
+  ]
+
   def start_link(_init) do
-    Agent.start_link(fn -> %{prompt: "", retries: 2, debug: false, explain_outputs: true} end,
+    Agent.start_link(
+      fn ->
+        %{
+          config: @openai_config,
+          provider: :openai,
+          prompt: "",
+          retries: 2,
+          debug: false,
+          explain_outputs: true,
+          model: Models.oai_models() |> hd() |> elem(0),
+          adapter: Application.get_env(:instructor, :adapter, Instructor.Adapters.OpenAI)
+        }
+      end,
       name: __MODULE__
     )
+  end
+
+  def update(:provider, :openai) do
+    Agent.update(__MODULE__, fn state ->
+      state
+      |> Map.put(:config, @openai_config)
+      |> Map.put(:provider, :openai)
+    end)
+  end
+
+  def update(:provider, :ollama) do
+    Agent.update(__MODULE__, fn state ->
+      state
+      |> Map.put(:config, @ollama_config)
+      |> Map.put(:provider, :ollama)
+    end)
+  end
+
+  def update(:provider, :gemini) do
+    Agent.update(__MODULE__, fn state ->
+      state
+      |> Map.put(:config, @gemini_config)
+      |> Map.put(:provider, :gemini)
+    end)
   end
 
   def update(key, value) do
@@ -334,7 +436,7 @@ defmodule Boilerplate do
 end
 ```
 
-## Setup Widgets
+## Setup Form
 
 ```elixir
 original = Kino.Frame.new()
@@ -347,13 +449,31 @@ undo_frame = Kino.Frame.new(placeholder: false)
 reset_frame = Kino.Frame.new(placeholder: false)
 undo_button = Kino.Control.button("Undo")
 reset_button = Kino.Control.button("Reset")
-stdout = Kino.Frame.new(placeholder: false)
+output = Kino.Frame.new(placeholder: false)
 logs = Kino.Frame.new(placeholder: false)
 debug_checkbox = Kino.Input.checkbox("Verbose Mode")
 debug_frame = Kino.Frame.new(placeholder: false)
 explain_checkbox = Kino.Input.checkbox("Explain Outputs", default: true)
 explain_frame = Kino.Frame.new(placeholder: false)
 retries = Kino.Input.number("# Retries", default: 2)
+
+provider =
+  Kino.Input.select("Provider", [{:openai, "OpenAI"}, {:gemini, "Gemini"}, {:ollama, "Ollama"}])
+
+models_frame = Kino.Frame.new(placeholder: false)
+oai_select = Kino.Input.select("Model", Models.oai_models())
+gemini_select = Kino.Input.select("Model", Models.gemini_models())
+
+ollama_select =
+  Kino.Input.select(
+    "Model",
+    if(Models.ollama_models() == [],
+      do: [{nil, "Pull Local Model to Use Ollama"}],
+      else: Models.ollama_models()
+    )
+  )
+
+Kino.Frame.render(models_frame, oai_select)
 
 Kino.Frame.render(
   original,
@@ -365,6 +485,7 @@ Kino.Frame.render(
   )
 )
 
+model_info = Kino.Layout.grid([provider, models_frame], columns: 2)
 inputs = Kino.Layout.grid([prompt, retries], columns: 2, gap: 10)
 
 buttons =
@@ -373,7 +494,7 @@ buttons =
     gap: 1
   )
 
-Kino.Layout.grid([original, inputs, upload, buttons, stdout, logs])
+Kino.Layout.grid([original, model_info, inputs, upload, buttons, output, logs])
 ```
 
 ## FFMPEG Instructions
@@ -420,45 +541,49 @@ defmodule Alfred do
     |> validate_inclusion(:confidence, @confidence_interval)
   end
 
-  def execute(prompt, command, retries, outputs \\ [stdout: nil, stderr: nil]) do
+  def execute(model, config, prompt, command, retries, outputs \\ [stdout: nil, stderr: nil]) do
     Instructor.chat_completion(
-      model: "gpt-4o",
-      response_model: __MODULE__,
-      max_retries: retries,
-      messages:
-        [
-          %{
-            role: "system",
-            content: @system_prompt
-          },
-          %{
-            role: "user",
-            content: """
-            Here's the prompt that generated the command: #{inspect(prompt)}
-            """
-          },
-          %{
-            role: "user",
-            content: """
-            Here's command: #{inspect(command)}
-            """
-          },
-          Keyword.get(outputs, :stdout) &&
+      [
+        mode: :json,
+        model: model,
+        response_model: __MODULE__,
+        max_retries: retries,
+        messages:
+          [
+            %{
+              role: "system",
+              content: @system_prompt
+            },
             %{
               role: "user",
               content: """
-              stdout: #{inspect(Keyword.fetch!(outputs, :stdout))}
+              Here's the prompt that generated the command: #{inspect(prompt)}
               """
             },
-          Keyword.get(outputs, :stderr) &&
             %{
               role: "user",
               content: """
-              stderr: #{inspect(Keyword.fetch!(outputs, :stderr))}
+              Here's command: #{inspect(command)}
               """
-            }
-        ]
-        |> Enum.filter(& &1)
+            },
+            Keyword.get(outputs, :stdout) &&
+              %{
+                role: "user",
+                content: """
+                stdout: #{inspect(Keyword.fetch!(outputs, :stdout))}
+                """
+              },
+            Keyword.get(outputs, :stderr) &&
+              %{
+                role: "user",
+                content: """
+                stderr: #{inspect(Keyword.fetch!(outputs, :stderr))}
+                """
+              }
+          ]
+          |> Enum.filter(& &1)
+      ],
+      config
     )
   end
 end
@@ -466,6 +591,7 @@ end
 
 ```elixir
 defmodule AutoFfmpeg do
+  import Ecto.Changeset
   use Ecto.Schema
   use Instructor.Validator
 
@@ -529,21 +655,37 @@ defmodule AutoFfmpeg do
   @impl true
   def validate_changeset(
         changeset,
-        %{
-          upload_path: upload_path,
-          debug: debug,
-          debug_frame: debug_frame,
-          output_frame: output_frame,
-          prompt: prompt,
-          explain: explain,
-          retries: retries
-        }
+        context
       ) do
-    program = Ecto.Changeset.get_field(changeset, :program)
-    program_args = Ecto.Changeset.get_field(changeset, :arguments)
-    input_args = ["-i", upload_path]
-    output_ext = Ecto.Changeset.get_field(changeset, :output_ext)
+    changeset
+    |> validate_required([:program, :arguments, :output_ext])
+    |> validate_exclusion(:arguments, ~w(-i))
+    |> validate_command(context)
+  end
 
+  defp validate_command(%Ecto.Changeset{valid?: false} = changeset, _context), do: changeset
+
+  defp validate_command(
+         changeset,
+         %{
+           upload_path: upload_path,
+           debug: debug,
+           debug_frame: debug_frame,
+           output_frame: output_frame,
+           prompt: prompt,
+           explain: explain,
+           retries: retries,
+           model: model,
+           config: config
+         }
+       ) do
+    program = get_field(changeset, :program)
+    program_args = get_field(changeset, :arguments)
+    input_args = ["-i", upload_path]
+    output_ext = get_field(changeset, :output_ext)
+
+    # Only perform command if arguments pass validation
+    # Otherwise skip running command and return arg errors
     output_args =
       cond do
         program == :ffprobe ->
@@ -561,7 +703,6 @@ defmodule AutoFfmpeg do
 
     if debug do
       message = """
-      <strong>Prompt:</strong> <em>#{prompt}</em><br><br>
       <strong>Command:</strong> <code>#{command}</code>
       """
 
@@ -593,7 +734,7 @@ defmodule AutoFfmpeg do
           end)
 
         if explain do
-          case Alfred.execute(prompt, command, retries, outputs) do
+          case Alfred.execute(model, config, prompt, command, retries, outputs) do
             {:ok, %Alfred{explanation: explanation, confidence: confidence}} ->
               Kino.Frame.append(
                 output_frame,
@@ -620,7 +761,7 @@ defmodule AutoFfmpeg do
 
         if program == :ffmpeg && output_ext != :null do
           [output_path] = output_args
-          Ecto.Changeset.put_change(changeset, :output_path, output_path)
+          put_change(changeset, :output_path, output_path)
         else
           changeset
         end
@@ -647,7 +788,7 @@ defmodule AutoFfmpeg do
               "Unexpected error occurred!"
           end
 
-        Ecto.Changeset.add_error(
+        add_error(
           changeset,
           :arguments,
           error,
@@ -656,30 +797,40 @@ defmodule AutoFfmpeg do
     end
   end
 
-  def execute(prompt, %{upload_path: upload_path} = context, retries) do
+  def execute(model, config, prompt, %{upload_path: upload_path} = context, retries) do
     Instructor.chat_completion(
-      model: "gpt-4o",
-      validation_context: Map.put(context, :prompt, prompt) |> Map.put(:retries, retries),
-      response_model: __MODULE__,
-      max_retries: retries,
-      messages: [
-        %{
-          role: "system",
-          content: @system_prompt
-        },
-        %{
-          role: "user",
-          content: """
-          Here's the editing task: #{inspect(prompt)}
-          """
-        },
-        %{
-          role: "user",
-          content: """
-          Here's input file type: #{inspect(Upload.ext_type(upload_path))}
-          """
-        }
-      ]
+      [
+        mode: :json,
+        model: model,
+        validation_context:
+          Map.merge(context, %{
+            prompt: prompt,
+            retries: retries,
+            model: model,
+            config: config
+          }),
+        response_model: __MODULE__,
+        max_retries: retries,
+        messages: [
+          %{
+            role: "system",
+            content: @system_prompt
+          },
+          %{
+            role: "user",
+            content: """
+            Here's the editing task: #{inspect(prompt)}
+            """
+          },
+          %{
+            role: "user",
+            content: """
+            Here's input file type: #{inspect(Upload.ext_type(upload_path))}
+            """
+          }
+        ]
+      ],
+      config
     )
   end
 end
@@ -698,10 +849,60 @@ import Upload
   prompt: prompt,
   debug: debug_checkbox,
   retries: retries,
-  explain: explain_checkbox
+  explain: explain_checkbox,
+  provider: provider,
+  oai_select: oai_select,
+  ollama_select: ollama_select,
+  gemini_select: gemini_select
 ]
 |> Kino.Control.tagged_stream()
 |> Kino.listen(fn
+  {model_select, %{type: :change, value: value}}
+  when model_select in [:oai_select, :ollama_select, :gemini_select] ->
+    FormState.update(:model, value)
+
+  {:provider, %{type: :change, value: value}} ->
+    Kino.Frame.clear(logs)
+    current_provider = FormState.get(:provider)
+
+    unless value == current_provider do
+      case value do
+        :ollama ->
+          if Models.ollama_models() == [] do
+            Kino.Frame.append(
+              logs,
+              Boilerplate.make_log(
+                "You must have local models to use Ollama. Pull a model then rerun this notebook.",
+                :error
+              )
+            )
+          end
+
+          Kino.Frame.render(models_frame, ollama_select)
+          FormState.update(:provider, value)
+          FormState.update(:model, Models.ollama_models() |> hd() |> elem(0))
+
+        :openai ->
+          Kino.Frame.render(models_frame, oai_select)
+          FormState.update(:provider, value)
+          FormState.update(:model, Models.oai_models() |> hd() |> elem(0))
+
+        :gemini ->
+          Kino.Frame.render(models_frame, gemini_select)
+          FormState.update(:provider, value)
+          FormState.update(:model, Models.gemini_models() |> hd() |> elem(0))
+
+        _ ->
+          Kino.Frame.append(
+            logs,
+            Boilerplate.make_log(
+              "Bad provider selected. Only OpenAI and Ollama are currently supported.",
+              :error
+            )
+          )
+      end
+    end
+
   {:explain, %{type: :change, value: value}} ->
     FormState.update(:explain_outputs, value)
 
@@ -723,7 +924,7 @@ import Upload
      }
    }} ->
     Kino.Frame.clear(logs)
-    Kino.Frame.clear(stdout)
+    Kino.Frame.clear(output)
     ext_type = Upload.ext_type(filename)
 
     unless is_valid_upload(ext_type) do
@@ -753,7 +954,7 @@ import Upload
 
   {:submit, %{type: :click}} ->
     Kino.Frame.clear(logs)
-    Kino.Frame.clear(stdout)
+    Kino.Frame.clear(output)
 
     prompt = FormState.get(:prompt) |> String.trim()
 
@@ -770,16 +971,39 @@ import Upload
       {%Upload{} =
          current_upload, _old_prompt} = EditHistory.current()
 
+      num_retries = FormState.get(:retries)
+      model = FormState.get(:model)
+      debug = FormState.get(:debug)
+
+      if debug do
+        message = """
+        <strong>Provider:</strong> <em>#{FormState.get(:provider)}</em><br><br>
+        <strong>Adapter:</strong> <em>#{FormState.get(:config) |> Keyword.fetch!(:adapter)}</em><br><br>
+        <strong>Model:</strong> <code>#{model}</code><br><br>
+        <strong>Prompt:</strong> <em>#{prompt}</em>
+        """
+
+        Kino.Frame.append(
+          logs,
+          Boilerplate.make_log(
+            message,
+            :info
+          )
+        )
+      end
+
       case AutoFfmpeg.execute(
+             model,
+             FormState.get(:config),
              prompt,
              %{
                upload_path: current_upload.path,
-               debug: FormState.get(:debug),
+               debug: debug,
                debug_frame: logs,
-               output_frame: stdout,
+               output_frame: output,
                explain: FormState.get(:explain_outputs)
              },
-             FormState.get(:retries)
+             num_retries
            ) do
         {:ok, %AutoFfmpeg{output_path: output_path}} ->
           FormState.get(:debug) &&
@@ -798,19 +1022,22 @@ import Upload
 
         {:error,
          %Ecto.Changeset{
-           changes: %{
-             arguments: _arguments,
-             output_ext: _output_ext
-           },
-           errors: [
-             arguments: {error, [status: _status]}
-           ],
+           errors: errors,
            valid?: false
          }} ->
           Upload.to_kino(current_upload) |> then(&Kino.Frame.render(original, &1))
 
-          Kino.Frame.append(logs, Boilerplate.make_log("Failed after 3 attempts!", :error))
-          Kino.Frame.append(logs, Boilerplate.make_log(error, :error))
+          Kino.Frame.append(
+            logs,
+            Boilerplate.make_log("Failed after #{num_retries} attempts!", :error)
+          )
+
+          Enum.each(errors, fn {field, error} ->
+            Kino.Frame.append(
+              logs,
+              Boilerplate.make_log("Error on field #{inspect(field)}: #{inspect(error)}", :error)
+            )
+          end)
 
         {:error, <<"LLM Adapter Error: ", error::binary>>} ->
           Upload.to_kino(current_upload) |> then(&Kino.Frame.render(original, &1))
@@ -833,13 +1060,13 @@ import Upload
     {%Upload{} = original_upload, nil} = EditHistory.reset()
     Upload.to_kino(original_upload) |> then(&Kino.Frame.render(original, &1))
     Kino.Frame.clear(logs)
-    Kino.Frame.clear(stdout)
+    Kino.Frame.clear(output)
     Kino.Frame.clear(reset_frame)
     Kino.Frame.clear(undo_frame)
 
   {:undo, %{type: :click}} ->
     Kino.Frame.clear(logs)
-    Kino.Frame.clear(stdout)
+    Kino.Frame.clear(output)
 
     case EditHistory.undo_edit() do
       nil ->
@@ -857,4 +1084,4 @@ import Upload
 end)
 ```
 
-<!-- livebook:{"offset":24220,"stamp":{"token":"XCP.THHgnGco1EzFjFhoJZtF8mEa8HV0nuXUCN2ZUFNXaPWlld4m2PUJJkeBoMDI7c3Mt8dEnMLwhL7h9On6sk9_Jbz7IgADzFunzT2AGWCRRExXwhIdBlDi","version":2}} -->
+<!-- livebook:{"offset":31158,"stamp":{"token":"XCP.-dXK9M1IdoAJTNHSUcZ6Rv0sMA89UvvID_8Z4tgPbMAUByOl80mlnN1cszFNnwvQdvwQsDc4afMz7wnRulcIz8hJLdoQr3YwzAN1cXOhoxiL3zSXWFOpAKprIXhpfc99wDUbW7RzF2LEAuy8cCGV9iU","version":2}} -->
